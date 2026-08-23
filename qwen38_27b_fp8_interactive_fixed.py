@@ -17,6 +17,8 @@ Qwen3.8-27B-FP8 单卡交互式推理脚本（已修复 gate_proj FP8 scale 丢�
   a      自动生成到 EOS 或 max-new-tokens
   q      停止当前回答
 
+启动时使用 --enable-tools 启用内置 Function Call 测试，默认不携带工具定义。
+
 对话时的命令：
   /image <路径或URL> [问题]  发送图片；包含空格的路径请加引号
   /clear                    清空对话历史
@@ -52,7 +54,6 @@ from transformers import (
 
 
 DEFAULT_MODEL_PATH = "/root/ai-models/Qwen3.8-27B-FP8"
-DEFAULT_PROMPT = "请用一句话解释什么是KV Cache。"
 DEFAULT_IMAGE_PROMPT = "请描述这张图片。"
 MAX_TOOL_ROUNDS = 4
 
@@ -146,7 +147,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Qwen3.8-27B-FP8 交互式推理")
     parser.add_argument("--model-path", default=DEFAULT_MODEL_PATH, help="本地模型目录")
     parser.add_argument("--device", default="cuda:0", help="运行设备，默认 cuda:0")
-    parser.add_argument("--prompt", default=DEFAULT_PROMPT, help="第一轮问题")
+    parser.add_argument(
+        "--prompt",
+        default="",
+        help="可选的第一轮问题；默认留空并在模型加载后等待用户输入",
+    )
     parser.add_argument(
         "--image",
         action="append",
@@ -158,7 +163,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--enable-tools",
         action="store_true",
-        help="启用内置模拟天气工具，测试 Function Call 的生成、执行与结果回传",
+        help="携带内置工具定义，启用 Function Call 的生成、执行与结果回传",
     )
     parser.add_argument("--auto", action="store_true", help="从第一个 token 开始自动生成")
     parser.add_argument(
@@ -1227,8 +1232,6 @@ def main() -> int:
 
         device = get_input_device(model, args.device)
         first_prompt = args.prompt
-        if args.image and args.prompt == DEFAULT_PROMPT:
-            first_prompt = DEFAULT_IMAGE_PROMPT
         run_chat_loop(
             model=model,
             processor=processor,
