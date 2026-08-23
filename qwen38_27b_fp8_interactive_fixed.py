@@ -10,7 +10,7 @@ Qwen3.8-27B-FP8 单卡交互式推理脚本（已修复 gate_proj FP8 scale 丢�
 - 可选启用内置模拟天气工具，测试完整 Function Call 闭环。
 - 第一轮打印 Prefill / Hidden States / KV Cache / 显存信息。
 - 生成过程可逐 token 继续，也可一键自动生成到 EOS。
-- 一轮结束后可继续输入新问题，保留对话历史。
+- 一轮结束后可继续输入新问题，并在 token 前缀一致时跨轮复用 KV Cache。
 
 生成时的命令：
   Enter  生成下一个 token
@@ -35,6 +35,7 @@ import shutil
 import subprocess
 import sys
 from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -78,6 +79,33 @@ TEST_TOOLS: list[dict[str, Any]] = [
         },
     }
 ]
+
+
+@dataclass
+class GenerationResult:
+    clean_text: str
+    raw_text: str
+    message_text: str
+    sequences: torch.LongTensor
+    past_key_values: Any
+
+
+@dataclass
+class ConversationKVCache:
+    """同时保存模型 Cache 和该 Cache 实际覆盖的精确 token 前缀。"""
+
+    past_key_values: Any = None
+    cached_prefix_ids: torch.LongTensor | None = None
+
+    @property
+    def length(self) -> int:
+        if self.cached_prefix_ids is None:
+            return 0
+        return int(self.cached_prefix_ids.shape[1])
+
+    def reset(self) -> None:
+        self.past_key_values = None
+        self.cached_prefix_ids = None
 
 
 def configure_utf8_output() -> None:
@@ -388,6 +416,8 @@ def apply_chat_template(
     template_kwargs: dict[str, Any] = {
         "add_generation_prompt": True,
         "enable_thinking": enable_thinking,
+        # 历史 assistant 的 think 块必须保持稳定，否则下一轮 token 前缀会变化。
+        "preserve_thinking": True,
         "tokenize": True,
         "return_dict": True,
         "return_tensors": "pt",
@@ -401,6 +431,132 @@ def apply_chat_template(
         name: value.to(device) if isinstance(value, torch.Tensor) else value
         for name, value in inputs.items()
     }
+
+
+def cache_sequence_length(past_key_values: Any) -> int:
+    if past_key_values is None:
+        return 0
+    get_seq_length = getattr(past_key_values, "get_seq_length", None)
+    if not callable(get_seq_length):
+        raise TypeError(f"当前 Cache 类型不支持 get_seq_length(): {type(past_key_values).__name__}")
+    return int(get_seq_length())
+
+
+def reset_model_cache_state(model: Any) -> None:
+    """清除 Qwen 多模态位置编码中与旧 Cache 绑定的派生状态。"""
+    model_core = getattr(model, "model", None)
+    if model_core is not None and hasattr(model_core, "rope_deltas"):
+        model_core.rope_deltas = None
+
+
+def reset_conversation_cache(cache_state: ConversationKVCache, model: Any, reason: str) -> None:
+    if cache_state.past_key_values is not None:
+        print(f"[KV Cache] 已重置: {reason}")
+    cache_state.reset()
+    reset_model_cache_state(model)
+
+
+def prepare_inputs_with_conversation_cache(
+    full_inputs: dict[str, Any],
+    cache_state: ConversationKVCache,
+    model: Any,
+    allow_reuse: bool,
+) -> tuple[dict[str, Any], bool]:
+    """校验完整 Prompt 前缀，让 Transformers 根据 Cache 长度自动切出新增 token。"""
+    if cache_state.past_key_values is None:
+        return full_inputs, False
+
+    if not allow_reuse:
+        reset_conversation_cache(cache_state, model, "当前轮包含新图片，需要重新编码视觉输入")
+        return full_inputs, False
+
+    try:
+        actual_cache_length = cache_sequence_length(cache_state.past_key_values)
+    except (TypeError, ValueError) as exc:
+        reset_conversation_cache(cache_state, model, str(exc))
+        return full_inputs, False
+
+    cached_prefix_ids = cache_state.cached_prefix_ids
+    if cached_prefix_ids is None or actual_cache_length != cache_state.length:
+        reset_conversation_cache(
+            cache_state,
+            model,
+            f"Cache 长度和已记录 token 不一致: cache={actual_cache_length}, token={cache_state.length}",
+        )
+        return full_inputs, False
+
+    full_input_ids = full_inputs["input_ids"]
+    full_length = int(full_input_ids.shape[1])
+    if full_length <= actual_cache_length:
+        reset_conversation_cache(
+            cache_state,
+            model,
+            f"新 Prompt 长度 {full_length} 没有超过 Cache 长度 {actual_cache_length}",
+        )
+        return full_inputs, False
+
+    expected_prefix = cached_prefix_ids.to(full_input_ids.device)
+    actual_prefix = full_input_ids[:, :actual_cache_length]
+    if expected_prefix.shape != actual_prefix.shape or not torch.equal(expected_prefix, actual_prefix):
+        reset_conversation_cache(cache_state, model, "聊天模板或历史 token 前缀发生变化")
+        return full_inputs, False
+
+    generation_inputs: dict[str, Any] = {
+        # input_ids 和 attention_mask 都保留完整长度。GenerationMixin 检测到
+        # past_key_values 后，会在 Prefill 内部自动切出 cache 之后的新增 token。
+        "input_ids": full_input_ids,
+        "attention_mask": full_inputs["attention_mask"],
+        "past_key_values": cache_state.past_key_values,
+    }
+    # 类型和位置字段也保留完整长度，GenerationMixin 会和 input_ids 一起切片。
+    # 不复制 pixel_values / image_grid_thw 等视觉字段：历史图片已经进入 Cache，
+    # 再传视觉张量会与内部切片后的 input_ids 不匹配。
+    for name in ("token_type_ids", "mm_token_type_ids", "position_ids"):
+        if name in full_inputs:
+            generation_inputs[name] = full_inputs[name]
+
+    continuation_length = full_length - actual_cache_length
+    print(
+        f"[KV Cache] 命中: 复用 {actual_cache_length} token，"
+        f"Transformers 将只 Prefill {continuation_length} 个新增 token"
+        f"（传入的完整 Prompt 为 {full_length} token）"
+    )
+    return generation_inputs, True
+
+
+def update_conversation_cache(
+    cache_state: ConversationKVCache,
+    generation_result: GenerationResult,
+    model: Any,
+) -> None:
+    """用本次实际送入 generate() 的序列补齐精确 Cache token 前缀。"""
+    new_cache = generation_result.past_key_values
+    if new_cache is None:
+        reset_conversation_cache(cache_state, model, "generate() 没有返回 past_key_values")
+        return
+
+    old_length = cache_state.length
+    try:
+        new_length = cache_sequence_length(new_cache)
+    except (TypeError, ValueError) as exc:
+        reset_conversation_cache(cache_state, model, str(exc))
+        return
+
+    sequence_length = int(generation_result.sequences.shape[1])
+    if new_length < 0 or new_length > sequence_length:
+        reset_conversation_cache(
+            cache_state,
+            model,
+            f"无法对齐 Cache: cache={new_length}, sequence={sequence_length}",
+        )
+        return
+
+    cache_state.past_key_values = new_cache
+    cache_state.cached_prefix_ids = generation_result.sequences[:, :new_length].detach().clone()
+    print(
+        f"[KV Cache] 已更新: {old_length} -> {new_length} token，"
+        f"当前完整序列仍有 {sequence_length - new_length} 个末尾 token 尚未写入 Cache"
+    )
 
 
 def inspect_prefill_once(model: Any, processor: Any, inputs: dict[str, Any]) -> None:
@@ -539,9 +695,32 @@ def normalize_eos_token_ids(tokenizer: Any, model: Any) -> set[int]:
     return result
 
 
-def strip_thinking_block(text: str) -> str:
-    # 对话历史默认只保留最终答案，避免将上一轮思考过程重新喂给模型。
-    return re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL).strip()
+def split_assistant_message(message_text: str, enable_thinking: bool) -> tuple[str, str]:
+    """拆分 Qwen 模板中的 reasoning_content 和最终 content，便于精确重建历史。"""
+    marker_start = "<think>\n"
+    marker_end = "\n</think>\n\n"
+    if message_text.startswith(marker_start) and marker_end in message_text:
+        reasoning_and_content = message_text[len(marker_start) :]
+        reasoning_content, content = reasoning_and_content.split(marker_end, 1)
+        return reasoning_content.strip(), content.strip()
+
+    # enable_thinking=True 时，generation prompt 已经以 ``<think>\n`` 结尾，
+    # 所以 generate() 返回的增量序列不会再次包含开标签，只包含思考正文和闭标签。
+    if enable_thinking:
+        if marker_end in message_text:
+            reasoning_content, content = message_text.split(marker_end, 1)
+            return reasoning_content.strip(), content.strip()
+        if "</think>" in message_text:
+            reasoning_content, content = message_text.split("</think>", 1)
+            return reasoning_content.strip(), content.strip()
+        # 用户中止或 max_new_tokens 截断在思考阶段时，也要把已有 token
+        # 记录为 reasoning_content，保证下一轮重新套模板后的 token 前缀不变。
+        return message_text.strip(), ""
+
+    match = re.match(r"^\s*<think>\s*(.*?)\s*</think>\s*(.*)$", message_text, flags=re.DOTALL)
+    if match:
+        return match.group(1).strip(), match.group(2).strip()
+    return "", message_text.strip()
 
 
 def generate_one_response(
@@ -550,7 +729,7 @@ def generate_one_response(
     inputs: dict[str, Any],
     max_new_tokens: int,
     start_auto: bool,
-) -> tuple[str, str, str]:
+) -> GenerationResult:
     section("开始交互式 Decode")
     print("操作方式：Enter=下一个 token，a=自动生成，q=停止当前回答")
 
@@ -565,23 +744,26 @@ def generate_one_response(
 
     torch.cuda.reset_peak_memory_stats()
     with torch.inference_mode():
-        generated_ids = model.generate(
+        generation_output = model.generate(
             **inputs,
             max_new_tokens=max_new_tokens,
             do_sample=False,
             use_cache=True,
+            return_dict_in_generate=True,
             stopping_criteria=StoppingCriteriaList([controller]),
         )
 
+    generated_ids = generation_output.sequences
     new_ids = generated_ids[0, input_length:]
     raw_text = processor.tokenizer.decode(new_ids, skip_special_tokens=False)
     clean_text = processor.tokenizer.decode(new_ids, skip_special_tokens=True).strip()
-    history_text = strip_thinking_block(raw_text)
-    history_text = processor.tokenizer.decode(
-        processor.tokenizer.encode(history_text, add_special_tokens=False),
-        skip_special_tokens=True,
-    ).strip()
-
+    message_end = int(new_ids.numel())
+    while message_end > 0 and int(new_ids[message_end - 1].item()) in eos_token_ids:
+        message_end -= 1
+    message_text = processor.tokenizer.decode(
+        new_ids[:message_end],
+        skip_special_tokens=False,
+    )
     section("当前回答结果")
     print("生成 token 数:", int(new_ids.numel()))
     print("生成 token ids:", new_ids.tolist())
@@ -604,9 +786,13 @@ def generate_one_response(
             token_text = processor.tokenizer.decode([token_id], skip_special_tokens=False)
             print(f"[警告] 发现异常重复 token: id={token_id}, token={token_text!r}, count={count}")
 
-    if not history_text:
-        history_text = clean_text
-    return clean_text, history_text, raw_text
+    return GenerationResult(
+        clean_text=clean_text,
+        raw_text=raw_text,
+        message_text=message_text,
+        sequences=generated_ids,
+        past_key_values=generation_output.past_key_values,
+    )
 
 
 def normalize_image_content(source: str) -> dict[str, str]:
@@ -653,10 +839,15 @@ def append_multimodal_user_message(
     )
 
 
-def append_assistant_message(messages: list[dict[str, Any]], text: str) -> None:
+def append_assistant_message(
+    messages: list[dict[str, Any]],
+    text: str,
+    reasoning_content: str = "",
+) -> None:
     messages.append(
         {
             "role": "assistant",
+            "reasoning_content": reasoning_content,
             "content": [{"type": "text", "text": text}],
         }
     )
@@ -748,10 +939,12 @@ def append_assistant_tool_calls(
     messages: list[dict[str, Any]],
     content: str,
     tool_calls: list[dict[str, Any]],
+    reasoning_content: str = "",
 ) -> None:
     messages.append(
         {
             "role": "assistant",
+            "reasoning_content": reasoning_content,
             "content": content,
             "tool_calls": tool_calls,
         }
@@ -781,6 +974,7 @@ def run_chat_loop(
     enable_tools: bool,
 ) -> None:
     messages: list[dict[str, Any]] = []
+    cache_state = ConversationKVCache()
     current_prompt = first_prompt.strip()
     current_images = [normalize_image_content(source) for source in first_images]
     first_round = True
@@ -788,6 +982,7 @@ def run_chat_loop(
     section("进入对话")
     print("enable_thinking:", enable_thinking)
     print("enable_tools:", enable_tools)
+    print("conversation_kv_cache: enabled（新增图片时自动回退完整 Prefill）")
     print("max_new_tokens:", max_new_tokens)
     print("对话命令: /image <路径或URL> [问题], /clear, /help, /exit")
     if enable_tools:
@@ -806,6 +1001,7 @@ def run_chat_loop(
             return
         if current_prompt.lower() == "/clear":
             messages.clear()
+            reset_conversation_cache(cache_state, model, "用户执行 /clear")
             current_images = []
             print("[OK] 已清空对话历史。")
             current_prompt = ""
@@ -842,42 +1038,68 @@ def run_chat_loop(
         for image in current_images:
             print("图片>", image.get("path") or image.get("url"))
         append_multimodal_user_message(messages, current_prompt, current_images)
-        inputs = apply_chat_template(
+        full_inputs = apply_chat_template(
             processor=processor,
             messages=messages,
             enable_thinking=enable_thinking,
             device=device,
             tools=TEST_TOOLS if enable_tools else None,
         )
+        inputs, _ = prepare_inputs_with_conversation_cache(
+            full_inputs=full_inputs,
+            cache_state=cache_state,
+            model=model,
+            allow_reuse=not current_images,
+        )
 
         if first_round and inspect_prefill:
-            inspect_prefill_once(model, processor, inputs)
+            inspect_prefill_once(model, processor, full_inputs)
 
         tool_round = 0
         while True:
-            _, history_text, raw_text = generate_one_response(
+            generation_result = generate_one_response(
                 model=model,
                 processor=processor,
                 inputs=inputs,
                 max_new_tokens=max_new_tokens,
                 start_auto=start_auto,
             )
-            tool_calls = parse_tool_calls(raw_text) if enable_tools else []
+            update_conversation_cache(cache_state, generation_result, model)
+            # Cache 的唯一长期所有者应是 cache_state，避免 /clear 或图片回退后仍被旧结果引用。
+            generation_result.past_key_values = None
+            reasoning_content, assistant_message_text = split_assistant_message(
+                generation_result.message_text,
+                enable_thinking=enable_thinking,
+            )
+            tool_calls = parse_tool_calls(generation_result.raw_text) if enable_tools else []
 
             if not tool_calls:
-                if enable_tools and "<tool_call>" in raw_text:
+                if enable_tools and "<tool_call>" in generation_result.raw_text:
                     print("[警告] 检测到工具调用标记，但格式不完整，已作为普通回答保留。")
-                append_assistant_message(messages, history_text)
+                append_assistant_message(
+                    messages,
+                    assistant_message_text,
+                    reasoning_content=reasoning_content,
+                )
                 break
 
             if tool_round >= MAX_TOOL_ROUNDS:
                 print(f"[警告] 已达到最大工具调用轮数 {MAX_TOOL_ROUNDS}，停止自动执行工具。")
-                append_assistant_message(messages, history_text)
+                append_assistant_message(
+                    messages,
+                    assistant_message_text,
+                    reasoning_content=reasoning_content,
+                )
                 break
             tool_round += 1
 
-            assistant_content = strip_thinking_block(raw_text).split("<tool_call>", 1)[0].strip()
-            append_assistant_tool_calls(messages, assistant_content, tool_calls)
+            assistant_content = assistant_message_text.split("<tool_call>", 1)[0].strip()
+            append_assistant_tool_calls(
+                messages,
+                assistant_content,
+                tool_calls,
+                reasoning_content=reasoning_content,
+            )
 
             section(f"执行工具（第 {tool_round} 轮）")
             for tool_call in tool_calls:
@@ -888,13 +1110,23 @@ def run_chat_loop(
                 print("结果:", json.dumps(result, ensure_ascii=False))
                 append_tool_result(messages, result)
 
-            inputs = apply_chat_template(
+            full_inputs = apply_chat_template(
                 processor=processor,
                 messages=messages,
                 enable_thinking=enable_thinking,
                 device=device,
                 tools=TEST_TOOLS,
             )
+            inputs, _ = prepare_inputs_with_conversation_cache(
+                full_inputs=full_inputs,
+                cache_state=cache_state,
+                model=model,
+                allow_reuse=True,
+            )
+
+        # 下轮会重新构造输入，及时释放历史图片张量和旧的 generate() 参数字典。
+        full_inputs = {}
+        inputs = {}
 
         if one_shot:
             return
