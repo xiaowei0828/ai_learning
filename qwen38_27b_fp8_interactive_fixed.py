@@ -7,6 +7,7 @@ Qwen3.8-27B-FP8 单卡交互式推理脚本（已修复 gate_proj FP8 scale 丢�
 - 修复 modules_to_not_convert 中未锚定的 *.mlp.gate 规则。
 - 确认 64 层 gate_proj 都是 FP8Linear，且 weight_scale_inv 已加载。
 - 支持文本以及本地图片/图片 URL 输入。
+- 可选启用内置模拟天气工具，测试完整 Function Call 闭环。
 - 第一轮打印 Prefill / Hidden States / KV Cache / 显存信息。
 - 生成过程可逐 token 继续，也可一键自动生成到 EOS。
 - 一轮结束后可继续输入新问题，保留对话历史。
@@ -27,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.metadata
+import json
 import re
 import shlex
 import shutil
@@ -50,6 +52,32 @@ from transformers import (
 DEFAULT_MODEL_PATH = "/root/ai-models/Qwen3.8-27B-FP8"
 DEFAULT_PROMPT = "请用一句话解释什么是KV Cache。"
 DEFAULT_IMAGE_PROMPT = "请描述这张图片。"
+MAX_TOOL_ROUNDS = 4
+
+TEST_TOOLS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_mock_weather",
+            "description": "返回指定城市的模拟天气数据，仅用于测试工具调用流程，不代表真实实时天气。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "city": {
+                        "type": "string",
+                        "description": "城市名称，例如北京、上海或杭州。",
+                    },
+                    "unit": {
+                        "type": "string",
+                        "enum": ["celsius", "fahrenheit"],
+                        "description": "温度单位，默认使用摄氏度。",
+                    },
+                },
+                "required": ["city"],
+            },
+        },
+    }
+]
 
 
 def configure_utf8_output() -> None:
@@ -98,6 +126,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-new-tokens", type=int, default=256, help="每轮最大生成 token 数")
     parser.add_argument("--enable-thinking", action="store_true", help="开启 thinking")
+    parser.add_argument(
+        "--enable-tools",
+        action="store_true",
+        help="启用内置模拟天气工具，测试 Function Call 的生成、执行与结果回传",
+    )
     parser.add_argument("--auto", action="store_true", help="从第一个 token 开始自动生成")
     parser.add_argument("--one-shot", action="store_true", help="第一轮回答完成后退出")
     parser.add_argument(
@@ -350,15 +383,19 @@ def apply_chat_template(
     messages: list[dict[str, Any]],
     enable_thinking: bool,
     device: torch.device,
+    tools: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    inputs = processor.apply_chat_template(
-        messages,
-        add_generation_prompt=True,
-        enable_thinking=enable_thinking,
-        tokenize=True,
-        return_dict=True,
-        return_tensors="pt",
-    )
+    template_kwargs: dict[str, Any] = {
+        "add_generation_prompt": True,
+        "enable_thinking": enable_thinking,
+        "tokenize": True,
+        "return_dict": True,
+        "return_tensors": "pt",
+    }
+    if tools is not None:
+        template_kwargs["tools"] = tools
+
+    inputs = processor.apply_chat_template(messages, **template_kwargs)
 
     return {
         name: value.to(device) if isinstance(value, torch.Tensor) else value
@@ -513,7 +550,7 @@ def generate_one_response(
     inputs: dict[str, Any],
     max_new_tokens: int,
     start_auto: bool,
-) -> tuple[str, str]:
+) -> tuple[str, str, str]:
     section("开始交互式 Decode")
     print("操作方式：Enter=下一个 token，a=自动生成，q=停止当前回答")
 
@@ -569,7 +606,7 @@ def generate_one_response(
 
     if not history_text:
         history_text = clean_text
-    return clean_text, history_text
+    return clean_text, history_text, raw_text
 
 
 def normalize_image_content(source: str) -> dict[str, str]:
@@ -625,6 +662,111 @@ def append_assistant_message(messages: list[dict[str, Any]], text: str) -> None:
     )
 
 
+TOOL_CALL_PATTERN = re.compile(
+    r"<tool_call>\s*<function=([^>\s]+)>\s*(.*?)\s*</function>\s*</tool_call>",
+    flags=re.DOTALL,
+)
+TOOL_PARAMETER_PATTERN = re.compile(
+    r"<parameter=([^>\s]+)>\s*(.*?)\s*</parameter>",
+    flags=re.DOTALL,
+)
+
+
+def parse_tool_argument(raw_value: str) -> Any:
+    value = raw_value.strip()
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return value
+
+
+def parse_tool_calls(text: str) -> list[dict[str, Any]]:
+    """解析 Qwen3.8 chat_template 约定的 qwen3_coder XML 风格工具调用。"""
+    tool_calls: list[dict[str, Any]] = []
+    for match in TOOL_CALL_PATTERN.finditer(text):
+        function_name = match.group(1).strip()
+        function_body = match.group(2)
+        arguments = {
+            parameter.group(1).strip(): parse_tool_argument(parameter.group(2))
+            for parameter in TOOL_PARAMETER_PATTERN.finditer(function_body)
+        }
+        tool_calls.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": function_name,
+                    "arguments": arguments,
+                },
+            }
+        )
+    return tool_calls
+
+
+def execute_tool_call(tool_call: dict[str, Any]) -> dict[str, Any]:
+    """只执行显式列入白名单的本地测试工具。"""
+    function = tool_call.get("function", {})
+    function_name = function.get("name")
+    arguments = function.get("arguments", {})
+
+    if function_name != "get_mock_weather":
+        return {
+            "ok": False,
+            "error": f"未知或不允许执行的工具: {function_name}",
+        }
+    if not isinstance(arguments, dict):
+        return {"ok": False, "error": "工具参数必须是对象"}
+
+    city = arguments.get("city")
+    unit = arguments.get("unit", "celsius")
+    if not isinstance(city, str) or not city.strip():
+        return {"ok": False, "error": "city 必须是非空字符串"}
+    if unit not in {"celsius", "fahrenheit"}:
+        return {"ok": False, "error": "unit 只能是 celsius 或 fahrenheit"}
+
+    city = city.strip()
+    weather_by_city = {
+        "北京": (26.0, "晴"),
+        "上海": (29.0, "多云"),
+        "杭州": (28.0, "小雨"),
+    }
+    temperature, condition = weather_by_city.get(city, (25.0, "晴间多云"))
+    if unit == "fahrenheit":
+        temperature = round(temperature * 9 / 5 + 32, 1)
+
+    return {
+        "ok": True,
+        "mock": True,
+        "city": city,
+        "temperature": temperature,
+        "unit": unit,
+        "condition": condition,
+        "notice": "这是本地固定的模拟数据，仅用于 Function Call 流程测试。",
+    }
+
+
+def append_assistant_tool_calls(
+    messages: list[dict[str, Any]],
+    content: str,
+    tool_calls: list[dict[str, Any]],
+) -> None:
+    messages.append(
+        {
+            "role": "assistant",
+            "content": content,
+            "tool_calls": tool_calls,
+        }
+    )
+
+
+def append_tool_result(messages: list[dict[str, Any]], result: dict[str, Any]) -> None:
+    messages.append(
+        {
+            "role": "tool",
+            "content": json.dumps(result, ensure_ascii=False),
+        }
+    )
+
+
 def run_chat_loop(
     model: Any,
     processor: Any,
@@ -636,6 +778,7 @@ def run_chat_loop(
     start_auto: bool,
     one_shot: bool,
     inspect_prefill: bool,
+    enable_tools: bool,
 ) -> None:
     messages: list[dict[str, Any]] = []
     current_prompt = first_prompt.strip()
@@ -644,8 +787,11 @@ def run_chat_loop(
 
     section("进入对话")
     print("enable_thinking:", enable_thinking)
+    print("enable_tools:", enable_tools)
     print("max_new_tokens:", max_new_tokens)
     print("对话命令: /image <路径或URL> [问题], /clear, /help, /exit")
+    if enable_tools:
+        print("可用测试工具: get_mock_weather（返回本地模拟数据）")
 
     while True:
         if not current_prompt:
@@ -667,6 +813,8 @@ def run_chat_loop(
 
         if current_prompt.lower() == "/help":
             print('  /image <路径或URL> [问题]  例如: /image "/data/my photo.jpg" 图片里有什么？')
+            if enable_tools:
+                print("  工具测试示例: 北京现在天气怎么样？请调用工具查询。")
             print("  /clear                    清空对话历史")
             print("  /exit                     退出程序")
             current_prompt = ""
@@ -699,19 +847,54 @@ def run_chat_loop(
             messages=messages,
             enable_thinking=enable_thinking,
             device=device,
+            tools=TEST_TOOLS if enable_tools else None,
         )
 
         if first_round and inspect_prefill:
             inspect_prefill_once(model, processor, inputs)
 
-        _, history_text = generate_one_response(
-            model=model,
-            processor=processor,
-            inputs=inputs,
-            max_new_tokens=max_new_tokens,
-            start_auto=start_auto,
-        )
-        append_assistant_message(messages, history_text)
+        tool_round = 0
+        while True:
+            _, history_text, raw_text = generate_one_response(
+                model=model,
+                processor=processor,
+                inputs=inputs,
+                max_new_tokens=max_new_tokens,
+                start_auto=start_auto,
+            )
+            tool_calls = parse_tool_calls(raw_text) if enable_tools else []
+
+            if not tool_calls:
+                if enable_tools and "<tool_call>" in raw_text:
+                    print("[警告] 检测到工具调用标记，但格式不完整，已作为普通回答保留。")
+                append_assistant_message(messages, history_text)
+                break
+
+            if tool_round >= MAX_TOOL_ROUNDS:
+                print(f"[警告] 已达到最大工具调用轮数 {MAX_TOOL_ROUNDS}，停止自动执行工具。")
+                append_assistant_message(messages, history_text)
+                break
+            tool_round += 1
+
+            assistant_content = strip_thinking_block(raw_text).split("<tool_call>", 1)[0].strip()
+            append_assistant_tool_calls(messages, assistant_content, tool_calls)
+
+            section(f"执行工具（第 {tool_round} 轮）")
+            for tool_call in tool_calls:
+                function = tool_call["function"]
+                print("工具名:", function["name"])
+                print("参数:", json.dumps(function["arguments"], ensure_ascii=False))
+                result = execute_tool_call(tool_call)
+                print("结果:", json.dumps(result, ensure_ascii=False))
+                append_tool_result(messages, result)
+
+            inputs = apply_chat_template(
+                processor=processor,
+                messages=messages,
+                enable_thinking=enable_thinking,
+                device=device,
+                tools=TEST_TOOLS,
+            )
 
         if one_shot:
             return
@@ -755,6 +938,7 @@ def main() -> int:
             start_auto=args.auto,
             one_shot=args.one_shot,
             inspect_prefill=not args.skip_prefill_inspection,
+            enable_tools=args.enable_tools,
         )
         return 0
     except KeyboardInterrupt:
