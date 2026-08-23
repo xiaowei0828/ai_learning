@@ -530,6 +530,36 @@ def prepare_inputs_with_conversation_cache(
     return generation_inputs, True
 
 
+def log_model_input_token_segments(
+    tokenizer: Any,
+    full_input_ids: torch.LongTensor,
+    cached_length: int,
+) -> None:
+    """以可读文本显示完整模型输入，并标记已缓存与本次新增的 token 区间。"""
+    token_ids = full_input_ids[0].detach().cpu().tolist()
+    total_length = len(token_ids)
+    cached_length = max(0, min(cached_length, total_length))
+
+    def decode_span(start: int, end: int) -> str:
+        if start >= end:
+            return "（无）"
+        return tokenizer.decode(
+            token_ids[start:end],
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        )
+
+    section("本次模型输入 Token 分区")
+    print(
+        f"总计 {total_length} token：KV Cache 前缀 {cached_length} token，"
+        f"本次新增 Prefill {total_length - cached_length} token"
+    )
+    print("\n----- KV Cache 已缓存前缀（这些 token 对应的 K/V 不会重复计算）-----")
+    print(decode_span(0, cached_length))
+    print("\n----- 本次新增输入（模型实际执行 Prefill 的 token）-----")
+    print(decode_span(cached_length, total_length), flush=True)
+
+
 def update_conversation_cache(
     cache_state: ConversationKVCache,
     generation_result: GenerationResult,
@@ -565,13 +595,17 @@ def update_conversation_cache(
     )
 
 
-def inspect_prefill_once(model: Any, processor: Any, inputs: dict[str, Any]) -> None:
+def inspect_prefill_once(
+    model: Any,
+    processor: Any,
+    inputs: dict[str, Any],
+    verbose_tokens: bool,
+) -> None:
     section("第一轮 Prefill 检查")
     input_ids = inputs["input_ids"]
     print("input_ids shape:", tuple(input_ids.shape))
-    print("token ids:", input_ids[0].tolist())
-    print("解码后的完整 Prompt:")
-    print(processor.tokenizer.decode(input_ids[0], skip_special_tokens=False))
+    if verbose_tokens:
+        print("token ids:", input_ids[0].tolist())
     print("输入字段:")
     for name, value in inputs.items():
         if isinstance(value, torch.Tensor):
@@ -1065,15 +1099,25 @@ def run_chat_loop(
             device=device,
             tools=TEST_TOOLS if enable_tools else None,
         )
-        inputs, _ = prepare_inputs_with_conversation_cache(
+        inputs, cache_reused = prepare_inputs_with_conversation_cache(
             full_inputs=full_inputs,
             cache_state=cache_state,
             model=model,
             allow_reuse=not current_images,
         )
+        log_model_input_token_segments(
+            tokenizer=processor.tokenizer,
+            full_input_ids=full_inputs["input_ids"],
+            cached_length=cache_state.length if cache_reused else 0,
+        )
 
         if first_round and inspect_prefill:
-            inspect_prefill_once(model, processor, full_inputs)
+            inspect_prefill_once(
+                model,
+                processor,
+                full_inputs,
+                verbose_tokens=verbose_tokens,
+            )
 
         tool_round = 0
         while True:
@@ -1138,11 +1182,16 @@ def run_chat_loop(
                 device=device,
                 tools=TEST_TOOLS,
             )
-            inputs, _ = prepare_inputs_with_conversation_cache(
+            inputs, cache_reused = prepare_inputs_with_conversation_cache(
                 full_inputs=full_inputs,
                 cache_state=cache_state,
                 model=model,
                 allow_reuse=True,
+            )
+            log_model_input_token_segments(
+                tokenizer=processor.tokenizer,
+                full_input_ids=full_inputs["input_ids"],
+                cached_length=cache_state.length if cache_reused else 0,
             )
 
         # 下轮会重新构造输入，及时释放历史图片张量和旧的 generate() 参数字典。
