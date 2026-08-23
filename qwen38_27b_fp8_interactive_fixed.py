@@ -47,6 +47,7 @@ from transformers import (
     Qwen3_5ForConditionalGeneration,
     StoppingCriteria,
     StoppingCriteriaList,
+    TextStreamer,
 )
 
 
@@ -160,6 +161,11 @@ def parse_args() -> argparse.Namespace:
         help="启用内置模拟天气工具，测试 Function Call 的生成、执行与结果回传",
     )
     parser.add_argument("--auto", action="store_true", help="从第一个 token 开始自动生成")
+    parser.add_argument(
+        "--verbose-tokens",
+        action="store_true",
+        help="打印每一步的 token ID/文本及最终原始 token；默认仅流式输出新增文本",
+    )
     parser.add_argument("--one-shot", action="store_true", help="第一轮回答完成后退出")
     parser.add_argument(
         "--skip-prefill-inspection",
@@ -613,13 +619,14 @@ class InteractiveTokenController(StoppingCriteria):
         prompt_length: int,
         eos_token_ids: set[int],
         start_auto: bool,
+        verbose_tokens: bool,
     ) -> None:
         super().__init__()
         self.tokenizer = tokenizer
-        self.prompt_length = prompt_length
         self.last_length = prompt_length
         self.eos_token_ids = eos_token_ids
         self.auto = start_auto
+        self.verbose_tokens = verbose_tokens
         self.stopped_by_user = False
         self.reached_eos = False
         self.step = 0
@@ -639,22 +646,14 @@ class InteractiveTokenController(StoppingCriteria):
         for position in range(self.last_length, current_length):
             token_id = int(input_ids[0, position].item())
             self.step += 1
-            token_text = self.tokenizer.decode([token_id], skip_special_tokens=False)
-            cumulative = self.tokenizer.decode(
-                input_ids[0, self.prompt_length : position + 1],
-                skip_special_tokens=False,
-            )
-            print(f"\n---------- Step {self.step} ----------")
-            print("token id:", token_id)
-            print("token:", repr(token_text))
-            print("累计生成内容:")
-            print(cumulative, flush=True)
+            if self.verbose_tokens:
+                token_text = self.tokenizer.decode([token_id], skip_special_tokens=False)
+                print(f"\n[Step {self.step}] token_id={token_id}, token={token_text!r}", flush=True)
 
         self.last_length = current_length
         latest_id = int(input_ids[0, -1].item())
         if latest_id in self.eos_token_ids:
             self.reached_eos = True
-            print("[EOS] 模型已完成当前回答。", flush=True)
             return self._decision(batch_size, device, True)
 
         if self.auto:
@@ -729,9 +728,13 @@ def generate_one_response(
     inputs: dict[str, Any],
     max_new_tokens: int,
     start_auto: bool,
+    verbose_tokens: bool,
 ) -> GenerationResult:
     section("开始交互式 Decode")
-    print("操作方式：Enter=下一个 token，a=自动生成，q=停止当前回答")
+    if start_auto:
+        print("自动生成中；按 Ctrl+C 可退出程序。")
+    else:
+        print("操作方式：Enter=下一个 token，a=自动生成，q=停止当前回答")
 
     input_length = int(inputs["input_ids"].shape[1])
     eos_token_ids = normalize_eos_token_ids(processor.tokenizer, model)
@@ -740,7 +743,17 @@ def generate_one_response(
         prompt_length=input_length,
         eos_token_ids=eos_token_ids,
         start_auto=start_auto,
+        verbose_tokens=verbose_tokens,
     )
+    streamer = None
+    if not verbose_tokens:
+        print("\n模型> ", end="", flush=True)
+        streamer = TextStreamer(
+            processor.tokenizer,
+            skip_prompt=True,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
 
     torch.cuda.reset_peak_memory_stats()
     with torch.inference_mode():
@@ -751,6 +764,7 @@ def generate_one_response(
             use_cache=True,
             return_dict_in_generate=True,
             stopping_criteria=StoppingCriteriaList([controller]),
+            streamer=streamer,
         )
 
     generated_ids = generation_output.sequences
@@ -764,14 +778,18 @@ def generate_one_response(
         new_ids[:message_end],
         skip_special_tokens=False,
     )
-    section("当前回答结果")
-    print("生成 token 数:", int(new_ids.numel()))
-    print("生成 token ids:", new_ids.tolist())
-    print("保留 special tokens:")
-    print(raw_text)
-    print("最终文本:")
-    print(clean_text)
-    print(f"峰值显存: {torch.cuda.max_memory_allocated() / 1024**3:.2f} GiB")
+    peak_memory_gib = torch.cuda.max_memory_allocated() / 1024**3
+    if verbose_tokens:
+        section("当前回答结果")
+        print("生成 token 数:", int(new_ids.numel()))
+        print("生成 token ids:", new_ids.tolist())
+        print("保留 special tokens:")
+        print(raw_text)
+        print("最终文本:")
+        print(clean_text)
+        print(f"峰值显存: {peak_memory_gib:.2f} GiB")
+    else:
+        print(f"[完成] 生成 {int(new_ids.numel())} token，峰值显存 {peak_memory_gib:.2f} GiB")
 
     if controller.stopped_by_user:
         print("[提示] 当前回答由用户提前停止。")
@@ -972,6 +990,7 @@ def run_chat_loop(
     one_shot: bool,
     inspect_prefill: bool,
     enable_tools: bool,
+    verbose_tokens: bool,
 ) -> None:
     messages: list[dict[str, Any]] = []
     cache_state = ConversationKVCache()
@@ -983,6 +1002,7 @@ def run_chat_loop(
     print("enable_thinking:", enable_thinking)
     print("enable_tools:", enable_tools)
     print("conversation_kv_cache: enabled（新增图片时自动回退完整 Prefill）")
+    print("token_output:", "verbose" if verbose_tokens else "streaming")
     print("max_new_tokens:", max_new_tokens)
     print("对话命令: /image <路径或URL> [问题], /clear, /help, /exit")
     if enable_tools:
@@ -1063,6 +1083,7 @@ def run_chat_loop(
                 inputs=inputs,
                 max_new_tokens=max_new_tokens,
                 start_auto=start_auto,
+                verbose_tokens=verbose_tokens,
             )
             update_conversation_cache(cache_state, generation_result, model)
             # Cache 的唯一长期所有者应是 cache_state，避免 /clear 或图片回退后仍被旧结果引用。
@@ -1171,6 +1192,7 @@ def main() -> int:
             one_shot=args.one_shot,
             inspect_prefill=not args.skip_prefill_inspection,
             enable_tools=args.enable_tools,
+            verbose_tokens=args.verbose_tokens,
         )
         return 0
     except KeyboardInterrupt:
