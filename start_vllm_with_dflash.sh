@@ -13,4 +13,5 @@ CUDA_VISIBLE_DEVICES=0 vllm serve /root/ai-models/Qwen3.8-27B-FP8 \
   --reasoning-parser qwen3 \
   --enable-auto-tool-choice \
   --tool-call-parser qwen3_coder \
+  --speculative-config '{"method":"dflash","model":"/root/ai-models/Qwen3.8-27B-DFlash2","num_speculative_tokens":7}' \
   --max-num-seqs 8
